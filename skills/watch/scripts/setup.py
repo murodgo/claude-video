@@ -15,6 +15,7 @@ from pathlib import Path
 from config import (CONFIG_DIR, CONFIG_FILE, ConfigError, DETAILS, ENGINES, get_config,
                     load_api_key, load_gemini_key, read_env_file, resolve_engine, write_settings)
 from runtime import configure_stdio, diagnostic, run_text
+import agy
 
 REQUIRED_BINARIES = ['ffmpeg', 'ffprobe', 'yt-dlp']
 WHISPERX_VERSION = '3.8.6'
@@ -23,8 +24,10 @@ ENV_TEMPLATE = '''# /watch configuration. No shell interpolation; last assignmen
 # Native captions always come first. Optional fallback: auto|whisperx|groq|openai|none.
 # auto preserves the Groq-then-OpenAI preference for existing installations.
 # The first-run skill wizard sets WATCH_DETAIL and WATCH_WHISPER_BACKEND.
-# WATCH_ENGINE=auto|gemini|local. auto uses Gemini when GEMINI_API_KEY is set.
+# WATCH_ENGINE=auto|gemini|agy|local. auto uses Gemini when GEMINI_API_KEY is set.
 # With the gemini engine, local videos are uploaded to Google for analysis.
+# agy: no key; Gemini through the signed-in Antigravity CLI reads the downloaded media.
+# WATCH_WHISPER_BACKEND=agy transcribes caption-less audio the same way.
 GEMINI_API_KEY=
 GROQ_API_KEY=
 OPENAI_API_KEY=
@@ -150,14 +153,22 @@ def _status(detailed=False):
         engine = resolve_engine(cfg['engine'], gemini_key)
     except ConfigError:
         engine = 'gemini'  # Explicitly chosen but the key is missing; gemini_key_present reports it.
-    binaries_required = engine == 'local'
+    binaries_required = engine in ('local', 'agy')
     has_key, detected = _have_api_key()
     chosen = cfg['whisper_backend']
+    agy_bin = agy.find_binary(cfg['agy_bin'])
     backend = detected if chosen == 'auto' else chosen
+    if chosen == 'auto' and not detected and agy_bin:
+        backend = 'agy'
     local_ready = _whisperx_status(cfg, detailed)
-    backend_ready = local_ready if chosen == 'whisperx' else (bool(load_api_key(backend)[1]) if backend in ('groq', 'openai') else chosen == 'none')
+    backend_ready = (local_ready if chosen == 'whisperx' else bool(agy_bin) if backend == 'agy'
+                     else bool(load_api_key(backend)[1]) if backend in ('groq', 'openai') else chosen == 'none')
+    if not agy_bin and (engine == 'agy' or chosen == 'agy'):
+        missing.append('agy')
+        binaries_required = True
     blocked = bool(missing) and binaries_required
     result = {'status': 'needs_install' if blocked else 'ready', 'can_proceed': not blocked,
+              'agy_bin': agy_bin, 'agy_model': cfg['agy_model'], 'agy_transcribe_model': cfg['agy_transcribe_model'],
               'engine': engine, 'configured_engine': cfg['engine'], 'gemini_key_present': gemini_key,
               'gemini_model': cfg['gemini_model'], 'binaries_required': binaries_required,
               'first_run': is_first_run(), 'setup_complete': not is_first_run(),
@@ -187,6 +198,8 @@ def cmd_check():
     status = _status()
     if status['can_proceed']:
         return 0
+    if 'agy' in status['missing_binaries']:
+        print(f'[watch] {agy._HINTS["missing"]}.', file=sys.stderr)
     print(f"[watch] Missing {', '.join(status['missing_binaries'])}. Run python3 \"{Path(__file__).resolve()}\".", file=sys.stderr)
     return 2
 
@@ -200,6 +213,9 @@ def cmd_install(backend=None, detail=None, engine=None):
     if engine:
         _scaffold_env()
         write_settings({'WATCH_ENGINE': engine}, CONFIG_FILE)
+    if (engine == 'agy' or backend == 'agy') and not agy.find_binary(get_config()['agy_bin']):
+        print(f'[setup] {agy._HINTS["missing"]}.', file=sys.stderr)
+        return 2
     if engine == 'gemini':
         if not load_gemini_key():
             print(f'[setup] Add GEMINI_API_KEY privately to {CONFIG_FILE} (free key: https://aistudio.google.com/apikey), '
@@ -318,7 +334,7 @@ def main():
     mode.add_argument('--check', action='store_true')
     mode.add_argument('--json', action='store_true')
     mode.add_argument('--install-whisperx', action='store_true')
-    parser.add_argument('--backend', choices=['auto', 'whisperx', 'groq', 'openai', 'none'])
+    parser.add_argument('--backend', choices=['auto', 'whisperx', 'groq', 'openai', 'agy', 'none'])
     parser.add_argument('--detail', choices=sorted(DETAILS))
     parser.add_argument('--engine', choices=sorted(ENGINES))
     args = parser.parse_args()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe a video via local WhisperX or the Groq/OpenAI Whisper APIs.
+"""Transcribe a video via local WhisperX, Gemini through agy, or the Groq/OpenAI Whisper APIs.
 
 Strategy: extract audio (mono 16kHz mp3, tiny payload), upload to whichever
 API has a key. Returns segments in the same shape as transcribe.parse_vtt so
@@ -344,6 +344,41 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
     return _segments_from_response(response)
 
 
+def time_chunks(total_seconds: float, chunk_seconds: float) -> list[tuple[float, float]]:
+    """Even (offset, duration) chunks no longer than chunk_seconds."""
+    if total_seconds <= chunk_seconds:
+        return [(0.0, total_seconds)]
+    n = math.ceil(total_seconds / chunk_seconds)
+    step = total_seconds / n
+    return [(round(i * step, 3), round(total_seconds - i * step if i == n - 1 else step, 3)) for i in range(n)]
+
+
+def _transcribe_agy(video_path: str, audio_out: Path) -> list[dict]:
+    import agy
+    from config import get_config
+    cfg = get_config()
+    binary = agy.find_binary(cfg["agy_bin"])
+    if not binary:
+        raise agy._fail("missing")
+    model = cfg["agy_transcribe_model"]
+    print(f"[watch] extracting audio for Gemini via agy ({model})…", file=sys.stderr)
+    audio_path = extract_audio(video_path, audio_out)
+    duration = audio_duration(audio_path)
+    plan = time_chunks(duration, agy.CHUNK_SECONDS)
+    chunks = [(audio_path, 0.0)] if len(plan) == 1 else split_audio(audio_path, audio_out.parent / "chunks", plan)
+    if len(chunks) > 1:
+        print(f"[watch] audio: {duration / 60:.0f} min — transcribing in {len(chunks)} chunks…", file=sys.stderr)
+    durations = {path: length for (path, _), (_, length) in zip(chunks, plan)}
+
+    def transcribe_one(path: Path) -> list[dict]:
+        return agy.transcribe_file(path, model=model, timeout=cfg["agy_timeout"], binary=binary,
+                                   duration=durations.get(path))
+
+    segments = transcribe_chunks(chunks, transcribe_one)
+    print(f"[watch] transcribed {len(segments)} segments via agy ({model})", file=sys.stderr)
+    return segments
+
+
 def transcribe_video(
     video_path: str,
     audio_out: Path,
@@ -362,6 +397,10 @@ def transcribe_video(
         from local_whisperx import transcribe_audio
         segments = transcribe_audio(extract_audio(video_path, audio_out))
         return segments, "whisperx"
+    if backend == "agy":
+        if api_key is not None:
+            raise SystemExit("agy signs in with your Google account and does not accept an API key.")
+        return _transcribe_agy(video_path, audio_out), "agy"
     if backend not in (None, "groq", "openai"):
         raise SystemExit("Unknown transcription backend.")
     if backend is None or api_key is None:
@@ -416,7 +455,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Transcribe local media with the selected Whisper backend.")
     parser.add_argument("video")
     parser.add_argument("audio_out", nargs="?", default="audio.mp3", type=Path)
-    parser.add_argument("--backend", choices=["groq", "openai", "whisperx"])
+    parser.add_argument("--backend", choices=["groq", "openai", "whisperx", "agy"])
     args = parser.parse_args()
     try:
         segments, backend = transcribe_video(args.video, Path(args.audio_out), backend=args.backend)

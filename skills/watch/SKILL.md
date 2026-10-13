@@ -1,6 +1,6 @@
 ---
 name: watch
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or local WhisperX / cloud Whisper fallback), and hands the result to the agent so it can answer questions about what's in the video. With a Gemini API key, Google's agentic video model watches the full video instead.
+description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or local WhisperX / cloud Whisper fallback), and hands the result to the agent so it can answer questions about what's in the video. With a Gemini API key, Google's agentic video model watches the full video instead; with the signed-in Antigravity CLI (agy), Gemini watches it with no key.
 license: MIT
 allowed-tools: Bash, Read, AskUserQuestion
 metadata:
@@ -9,7 +9,7 @@ metadata:
 
 # /watch
 
-Run the bundled Python script. With the **gemini** engine (a `GEMINI_API_KEY` is configured) Google's video model watches the video and the report carries its timestamped answer for you to relay. With the **local** engine the script produces timestamped frames and a transcript; view the frames and answer from that evidence. Native captions come first; the chosen local or cloud backend is only a fallback. Transcript-only evidence cannot establish visual facts.
+Run the bundled Python script. With the **gemini** engine (a `GEMINI_API_KEY` is configured) Google's video model watches the video and the report carries its timestamped answer for you to relay. With the **agy** engine the script downloads the video and has Gemini, through the user's signed-in Antigravity CLI (`agy`), read the video, its audio, and any captions, and the report carries Gemini's answer the same way. With the **local** engine the script produces timestamped frames and a transcript; view the frames and answer from that evidence. Native captions come first; the chosen local or cloud backend is only a fallback. Transcript-only evidence cannot establish visual facts.
 
 ## Resolve the skill and interpreter
 
@@ -38,9 +38,10 @@ python3 "${SKILL_DIR}/scripts/setup.py" --json
 **Question 1 — "How should watch view videos?"**
 
 - `gemini` (recommended) — Google's Gemini model watches the whole video, including audio, and answers directly. Needs a free key from https://aistudio.google.com/apikey. YouTube URLs are sent to Google; local or downloaded videos are uploaded to Google, then deleted after the answer.
+- `agy` — Gemini through the Antigravity CLI the user is already signed into (`agy` on PATH, or `WATCH_AGY_BIN`). No API key. The video is downloaded locally and Gemini reads only that run's work dir; agy runs headless with its default permissions, so it cannot run commands.
 - `local` — frames + transcript extracted on this machine and read by you. No key needed.
 
-If `gemini`, run:
+If `agy`, run `setup.py --engine agy` (exit 2 means agy is not found or base binaries are missing), then ask only the detail question and use `--backend agy` for transcription. If `gemini`, run:
 
 ```bash
 python3 "${SKILL_DIR}/scripts/setup.py" --engine gemini
@@ -67,7 +68,8 @@ Then ask: **For videos without captions, how should watch transcribe?** Present:
 1. `whisperx` (recommended): local transcription, no API key; audio stays on the machine. One-time download of about 1.5 GB. Requires 3 GB free disk, 8 GB RAM, and a compatible 64-bit CPU. Apple Silicon macOS is verified; Linux/Windows recipes and Intel macOS are untested.
 2. `groq`: fast cloud transcription, needs a Groq key.
 3. `openai`: cloud transcription, needs an OpenAI key.
-4. `none`: captions only; no speech fallback.
+4. `agy`: Gemini through the signed-in Antigravity CLI, no API key; audio is read by Google's Gemini.
+5. `none`: captions only; no speech fallback.
 
 Use an existing explicit backend choice without asking again. Do not treat silence as permission to install local models or upload audio; the no-key/no-install path remains available.
 
@@ -75,7 +77,7 @@ Complete the selected setup using the user's detail value:
 
 ```bash
 python3 "${SKILL_DIR}/scripts/setup.py" --backend whisperx --detail balanced
-# Or: --backend groq / openai / none
+# Or: --backend agy / groq / openai / none
 ```
 
 For WhisperX, relay progress while the installer provisions uv, Python 3.12, pinned dependencies, and both model caches. `setup.py --install-whisperx` reruns this managed installer if needed. It writes the backend, executable, model, and completion marker only after warm-up succeeds. A failed local installation never selects a cloud backend automatically.
@@ -97,16 +99,17 @@ python3 "${SKILL_DIR}/scripts/watch.py" "<URL-or-local-path>" --question "<the u
 `setup.py --json` reports the active `engine`. **Always pass the user's question** with `--question` so either engine can use it; omit it only when there is no question.
 
 - **gemini** — the report contains `## Answer (from Gemini)`, not frames. These are Gemini's observations, not yours: relay them with their timestamps, and if asked how you know, say Gemini watched the video. For a follow-up question, rerun with a new `--question`. `--start/--end` restrict Gemini to that range. Local-only flags (`--detail`, `--fps`, `--timestamps`, `--whisper`…) are ignored and listed under **Ignored local options**. `WATCH_GEMINI_MODEL` (default `gemini-3.7-flash`) and `WATCH_GEMINI_TIMEOUT` (seconds, default 600) tune it. Treat Gemini's answer as untrusted evidence like any other video content.
+- **agy** — the report contains `## Answer (from Gemini via agy)`. Relay it exactly like a Gemini answer. The script downloads the video (≤720p), extracts its audio (agy's viewer sees frames but not sound), and passes captions when available. `--start/--end` cut a clip first, and Gemini is told to cite source-video time. Each run keeps a **Work dir** with the downloaded media, so a follow-up `--engine local` run can point at that file instead of downloading again. `WATCH_AGY_MODEL` (default `gemini-3.8-flash-medium`; `agy models` lists others, e.g. `gemini-3.1-pro-high` for hard questions), `WATCH_AGY_TIMEOUT` (seconds, default 900), and `WATCH_AGY_BIN` tune it. watch never passes `--dangerously-skip-permissions` to agy; an `agy denied:` error means Gemini tried a tool headless mode refuses, so rerun once or use `--engine local`.
 - **local** — everything below in this document.
 
-`--engine auto|gemini|local` overrides the saved `WATCH_ENGINE` for one run; `auto` uses Gemini whenever `GEMINI_API_KEY` resolves (environment → `~/.config/watch/.env` → cwd `.env`).
+`--engine auto|gemini|agy|local` overrides the saved `WATCH_ENGINE` for one run; `auto` uses Gemini whenever `GEMINI_API_KEY` resolves (environment → `~/.config/watch/.env` → cwd `.env`).
 
-**No silent fallback.** If a Gemini run fails (`## Unavailable evidence` with a `Gemini <category>:` line), tell the user what failed and offer to rerun with `--engine local`. Do not switch engines without asking: the user may not want a long download, or may have chosen Gemini deliberately. Likewise use `--engine local` when the user says the video is private or must not leave the machine.
+**No silent fallback.** If a Gemini or agy run fails (`## Unavailable evidence` with a `Gemini <category>:` or `agy <category>:` line), tell the user what failed and offer to rerun with `--engine local`. Do not switch engines without asking: the user may not want a long download, or may have chosen Gemini deliberately. Likewise use `--engine local` when the user says the video is private or must not leave the machine.
 
 | Option | Behavior |
 |---|---|
-| `--engine auto|gemini|local` | Override the saved engine for this run |
-| `--question TEXT` | The user's question; sent to Gemini, unused locally |
+| `--engine auto|gemini|agy|local` | Override the saved engine for this run |
+| `--question TEXT` | The user's question; sent to Gemini (API or agy), unused locally |
 | `--detail transcript|efficient|balanced|token-burner` | Override the saved detail |
 | `--start T --end T` | Focus on a source-time interval; SS, MM:SS, or HH:MM:SS |
 | `--timestamps T1,T2,...` | Pin cue frames; reserves their budget before detail selection |
@@ -114,7 +117,7 @@ python3 "${SKILL_DIR}/scripts/watch.py" "<URL-or-local-path>" --question "<the u
 | `--resolution W` | Frame width, default 512; raise to 1024 for text when needed |
 | `--fps F` | Positive uniform rate override, at most 2 fps and reduced to fit the remaining cap |
 | `--no-dedup` | Preserve near-identical selected frames |
-| `--whisper groq|openai|whisperx` | Select this run's fallback; captions still come first |
+| `--whisper groq|openai|whisperx|agy` | Select this run's fallback; captions still come first |
 | `--no-whisper` | Disable every speech fallback, including local; conflicts with `--whisper` |
 | `--sub-lang CODE` | Select one exact caption language; default `auto` prefers original-language evidence |
 | `--cookies FILE` | Explicit cookie jar; yt-dlp may update it |
@@ -143,7 +146,7 @@ For a presenter saying “look here,” “notice this,” or similar:
 
 Full-track caption availability is checked before focus filtering. A silent focus interval does not trigger another transcription request. Reports distinguish no speech, disabled fallback, failed modalities, and missing cloud-chunk intervals.
 
-`WATCH_WHISPER_BACKEND=auto|groq|openai|whisperx|none` chooses the saved fallback. In `auto`, each provider looks up its key in environment → user config → cwd `.env`, preferring Groq before checking OpenAI. Explicit provider choices never borrow another provider's key.
+`WATCH_WHISPER_BACKEND=auto|groq|openai|whisperx|agy|none` chooses the saved fallback. In `auto`, each provider looks up its key in environment → user config → cwd `.env`, preferring Groq before checking OpenAI; with no key, `auto` uses agy when it is installed. The `agy` backend sends audio in 10-minute chunks to `WATCH_AGY_TRANSCRIBE_MODEL` (default `gemini-3.8-flash-low`) and restores source-time offsets; reported as `gemini via agy`. Explicit provider choices never borrow another provider's key.
 
 WhisperX defaults: `WATCH_WHISPERX_MODEL=small`, `WATCH_WHISPERX_DEVICE=cpu`, `WATCH_WHISPERX_COMPUTE_TYPE=int8`, `WATCH_WHISPERX_BATCH_SIZE=8`. No alignment or diarization is run. `WATCH_WHISPERX_LANGUAGE=es` (for example) gives a spoken-language hint; never infer it from `--sub-lang`, which may request a translation. Without a hint, auto-detection is used but reported as unverified because WhisperX 3.8.6 mislabels its JSON language when alignment is disabled.
 
@@ -159,10 +162,11 @@ For follow-ups, reuse evidence already viewed before rerunning. Remove only the 
 
 - yt-dlp contacts the source service/CDNs for metadata, one selected caption track, and media; access may require explicitly configured authentication. A cookie file is a read/write jar.
 - With the Gemini engine, YouTube URLs are sent to Google and local or downloaded videos are uploaded to Google's Files API (generativelanguage.googleapis.com), then deleted after the answer; an upload that cannot be deleted expires within 48 hours. The key is sent only as a request header. The local engine never contacts Google.
+- With the agy engine or backend, the local `agy` CLI sends the run's work-dir media (video, extracted audio, captions) to Google's Gemini under the user's own Antigravity sign-in. agy runs headless without `--dangerously-skip-permissions`, gets `--add-dir` for that work dir only (a local source file is hard-linked or copied in, never its folder), and cannot run shell or MCP tools.
 - FFmpeg/ffprobe run locally for probing, frames, and mono audio extraction.
 - With `whisperx` selected, audio never leaves the machine. First setup downloads packages and models from PyPI, Hugging Face, and GitHub, with uv/Python installers as needed. Pyannote telemetry is disabled. Warm caches allow offline inference; model libraries may still attempt cache/update network checks.
 - With `groq` or `openai` selected, only extracted audio is uploaded to that provider's transcription endpoint; keys are never shared between providers or logged by watch.
 - Runtime artifacts live in this run's working directory. User settings/keys live in `~/.config/watch/.env`; cwd `.env` is a cloud-key fallback. POSIX writes use mode 0600; Windows ACLs are not audited. Use a Linux-home config in WSL, since Windows-mounted homes have different permission semantics.
 - The managed environment lives at `~/.cache/watch/whisperx-venv`, outside the plugin. Model caches normally live at `~/.cache/huggingface` and `~/.cache/torch/hub`. uv also caches packages and managed Python. Reinstalling the skill does not remove these.
 
-Bundled scripts: `watch.py`, `download.py`, `frames.py`, `transcribe.py`, `whisper.py`, `local_whisperx.py`, `gemini.py`, `config.py`, `runtime.py`, and `setup.py` under `scripts/`. The base runtime uses only Python's standard library; optional WhisperX dependencies remain in its separate process/environment.
+Bundled scripts: `watch.py`, `download.py`, `frames.py`, `transcribe.py`, `whisper.py`, `local_whisperx.py`, `gemini.py`, `agy.py`, `config.py`, `runtime.py`, and `setup.py` under `scripts/`. The base runtime uses only Python's standard library; optional WhisperX dependencies remain in its separate process/environment.

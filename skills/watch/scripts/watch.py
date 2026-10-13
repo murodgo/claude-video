@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import shutil
 import sys
 import tempfile
@@ -18,11 +19,13 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import ConfigError, frame_cap, get_config, load_gemini_key, resolve_engine  # noqa: E402
+import agy  # noqa: E402
 import gemini  # noqa: E402
 from download import download, fetch_captions, is_url, auth_args  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps, validate_controls  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from whisper import extract_audio, load_api_key, transcribe_video  # noqa: E402
+from runtime import run_text  # noqa: E402
 from runtime import configure_stdio  # noqa: E402
 
 
@@ -91,6 +94,136 @@ def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
     return 0
 
 
+# agy sends the whole file inline in one request. A full-size phone clip (66 MB of 1080p HEVC for
+# 57 s) hung for over 15 min or died with "write: broken pipe"; the same clip at 720p (6.6 MB,
+# ~6 s to encode) answered in ~2 min. Gemini samples video at about 1 fps anyway.
+AGY_PROXY_MIN_BYTES = 20_000_000
+AGY_PROXY_SHORT_SIDE = 720
+
+
+def _agy_view(source: Path, work: Path, start_sec, end_sec, meta=None) -> Path:
+    """The file agy opens: the focus range, or the whole video - as-is when small, else a 720p proxy."""
+    clip = start_sec is not None or end_sec is not None
+    if not clip:
+        dims = [d for d in ((meta or {}).get("width"), (meta or {}).get("height")) if d]
+        small = source.stat().st_size <= AGY_PROXY_MIN_BYTES and (not dims or min(dims) <= AGY_PROXY_SHORT_SIDE)
+        if small:
+            if source.resolve().is_relative_to(work.resolve()):
+                return source
+            view = work / f"source{source.suffix or '.mp4'}"
+            try:
+                os.link(source, view)
+            except OSError:
+                shutil.copy2(source, view)  # agy only reads inside the work dir; never widen it to the user's folder.
+            return view
+    view = work / ("clip.mp4" if clip else "proxy.mp4")
+    side = AGY_PROXY_SHORT_SIDE
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if start_sec is not None:
+        cmd += ["-ss", f"{start_sec:.3f}"]
+    if end_sec is not None:
+        cmd += ["-to", f"{end_sec:.3f}"] if start_sec is None else ["-t", f"{end_sec - start_sec:.3f}"]
+    cmd += ["-i", str(source.resolve()), "-map", "0:v:0", "-map", "0:a:0?",  # drop phone metadata tracks
+            "-vf", f"scale='if(gt(iw,ih),-2,min({side},iw))':'if(gt(iw,ih),min({side},ih),-2)'",  # short side
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-c:a", "aac", "-b:a", "96k", str(view)]
+    result = run_text(cmd)
+    if result.returncode or not view.exists():
+        what = "cut the focus range" if clip else "make the 720p proxy"
+        raise SystemExit(f"ffmpeg could not {what}: {result.stderr.strip()}")
+    return view
+
+
+def run_agy(args, config, start_sec, end_sec, auth) -> int:
+    """Gemini, signed in through the agy CLI, watches local media. No API key; nothing is uploaded by us."""
+    ignored = [flag for flag, name in LOCAL_ONLY_FLAGS
+               if name not in ("whisper", "sub_lang") and getattr(args, name) is not None]
+    ignored += ["--no-dedup"] if args.no_dedup else []
+    clip = start_sec is not None or end_sec is not None
+    binary = agy.find_binary(config["agy_bin"])
+    parent = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
+    if parent:
+        parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="watch-", dir=parent))
+    print(f"[watch] working dir: {work}", file=sys.stderr)
+    dl, result, error, notes, transcript_label = {"info": {}}, None, None, [], None
+    try:
+        if not binary:
+            raise agy._fail("missing")
+        segments = []
+        if is_url(args.source):
+            print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
+            dl = fetch_captions(args.source, work / "download",
+                                sub_lang=args.sub_lang or config["sub_lang"], **auth)
+            if dl.get("subtitle_path"):
+                try:
+                    segments = parse_vtt(dl["subtitle_path"])
+                except (OSError, ValueError) as exc:
+                    notes.append(f"Caption parsing failed: {exc}")
+            print("[watch] downloading media…", file=sys.stderr)
+            dl.update(download(args.source, work / "download", context=dl, **auth))
+        else:
+            print("[watch] using local file…", file=sys.stderr)
+            dl.update(download(args.source, work / "download"))
+        source = Path(dl["video_path"])
+        meta = get_metadata(str(source))
+        if clip and start_sec is not None and meta["duration_seconds"] and start_sec >= meta["duration_seconds"]:
+            raise SystemExit(f"--start {start_sec:.1f}s is past end of video ({meta['duration_seconds']:.1f}s)")
+        view = _agy_view(source, work, start_sec, end_sec, meta)
+        audio = None
+        if meta.get("has_audio"):
+            audio = extract_audio(str(view), work / "audio.mp3")
+        transcript = None
+        segments = filter_range(segments, start_sec, end_sec) if clip else segments
+        if segments:
+            transcript = work / "captions.txt"
+            transcript.write_text(format_transcript(segments) + "\n", encoding="utf-8")
+            track = dl.get("caption_track") or {}
+            transcript_label = f"captions ({track.get('language', 'unknown')}, {track.get('kind', 'unknown')})"
+        print(f"[watch] asking {config['agy_model']} via agy…", file=sys.stderr)
+        result = agy.ask(args.question, video=view, audio=audio, transcript=transcript, offset=start_sec or 0.0,
+                         model=config["agy_model"], timeout=config["agy_timeout"], binary=binary, work=work)
+    except SystemExit as exc:
+        error = str(exc)
+
+    info = dl.get("info") or {}
+    print()
+    print("# watch: video report")
+    print()
+    print(f"- **Source:** {args.source} (read locally by agy; Gemini sees only the work dir)")
+    if info.get("title"):
+        print(f"- **Title:** {info['title']}")
+    if info.get("uploader"):
+        print(f"- **Uploader:** {info['uploader']}")
+    print(f"- **Engine:** agy {config['agy_model']} ({'answered' if result else 'failed'})")
+    if clip:
+        print(f"- **Focus range:** {format_time(start_sec or 0)} → {format_time(end_sec) if end_sec is not None else 'end'}")
+    if transcript_label:
+        print(f"- **Captions given to Gemini:** {transcript_label}")
+    if ignored:
+        print(f"- **Ignored local options:** {', '.join(ignored)} (these only apply with --engine local)")
+    if result and result["total_tokens"] is not None:
+        print(f"- **Gemini tokens:** {result['total_tokens']}")
+    for note in notes:
+        print(f"- **Note:** {note}")
+    print()
+    if error:
+        print("## Unavailable evidence")
+        print()
+        print(f"- {error}")
+        print("- No local fallback was attempted; rerun with `--engine local` to use frames + transcript.")
+    else:
+        print("## Answer (from Gemini via agy)")
+        print()
+        print("_These are Gemini's observations of the video, not frames you viewed yourself. "
+              "Relay them as such; rerun with `--engine local` (same work dir media) to inspect frames directly._")
+        print()
+        print(result["text"])
+    print()
+    print("---")
+    print(f"_Work dir: `{work}` — delete when done._")
+    return 1 if error else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
@@ -125,7 +258,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai", "whisperx"],
+        choices=["groq", "openai", "whisperx", "agy"],
         default=None,
         help="Select the fallback backend for this run; native captions still come first.",
     )
@@ -139,11 +272,12 @@ def main() -> int:
     cookies = ap.add_mutually_exclusive_group()
     cookies.add_argument("--cookies", default=None, help="Explicit cookie file (yt-dlp may update this jar)")
     cookies.add_argument("--cookies-from-browser", default=None, help="Explicit yt-dlp browser selector")
-    ap.add_argument("--engine", choices=["auto", "gemini", "local"], default=None,
+    ap.add_argument("--engine", choices=["auto", "gemini", "agy", "local"], default=None,
                     help="gemini: Google watches the video and answers (needs GEMINI_API_KEY). "
+                         "agy: Gemini via the signed-in Antigravity CLI reads the downloaded video and audio. "
                          "local: frames + transcript on this machine. Default auto: gemini when a key exists.")
     ap.add_argument("--question", default=None,
-                    help="The user's question. Sent to Gemini on a gemini run; unused by the local engine.")
+                    help="The user's question. Sent to Gemini on a gemini or agy run; unused by the local engine.")
     args = ap.parse_args()
     if args.no_whisper and args.whisper:
         ap.error("--no-whisper conflicts with --whisper")
@@ -162,8 +296,11 @@ def main() -> int:
     auth = {"cookies_file": cookies_file, "cookies_from_browser": cookies_browser}
 
     gemini_key = load_gemini_key()
-    if resolve_engine(args.engine or config["engine"], bool(gemini_key)) == "gemini":
+    engine = resolve_engine(args.engine or config["engine"], bool(gemini_key))
+    if engine == "gemini":
         return run_gemini(args, config, gemini_key, start_sec, end_sec, auth)
+    if engine == "agy":
+        return run_agy(args, config, start_sec, end_sec, auth)
 
     parent = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
     if parent:
@@ -265,14 +402,21 @@ def main() -> int:
 
     transcript_state = "missing"
     if not track_available and backend_choice != "none" and video_path and meta.get("has_audio"):
-        backend, api_key = ("whisperx", None) if backend_choice == "whisperx" else load_api_key(None if backend_choice == "auto" else backend_choice)
+        if backend_choice in ("whisperx", "agy"):
+            backend, api_key = backend_choice, None
+        else:
+            backend, api_key = load_api_key(None if backend_choice == "auto" else backend_choice)
+            if not backend and backend_choice == "auto" and agy.find_binary(config["agy_bin"]):
+                backend = "agy"  # Last resort for keyless installs: Gemini through the signed-in agy CLI.
         if backend:
             try:
                 all_segments, used_backend = transcribe_video(video_path, work / "audio.mp3", backend=backend, api_key=api_key)
                 gaps = getattr(all_segments, "gaps", [])
                 track_available = True
                 transcript_state = "no speech" if not all_segments else "available"
-                if used_backend == "whisperx":
+                if used_backend == "agy":
+                    transcript_source = f"gemini via agy ({config['agy_transcribe_model']})"
+                elif used_backend == "whisperx":
                     language = config["whisperx_language"] or "auto (unverified)"
                     transcript_source = f"whisper (whisperx {config['whisperx_model']}, language {language})"
                 else:

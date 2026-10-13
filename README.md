@@ -1,5 +1,12 @@
 # /watch
 
+> **Fork of [bradautomates/claude-video](https://github.com/bradautomates/claude-video)** adding an **`agy` engine**: Gemini watches the video through your signed-in [Antigravity](https://antigravity.google) CLI — no API key. Use `--engine agy` (or `WATCH_ENGINE=agy`), and `--whisper agy` for caption-less transcription. Install this fork in Claude Code:
+>
+> ```
+> /plugin marketplace add murodgo/claude-video
+> /plugin install watch@claude-video
+> ```
+
 Give an agent video evidence: a URL or local file becomes timestamped frames and a transcript. Install it in Claude Code (the desktop app, VS Code, or a terminal), or use it with Codex and other [Agent Skills](https://agentskills.io) hosts. Native captions come first; optional local WhisperX or Groq/OpenAI transcription handles videos without captions.
 
 ## Choose your app

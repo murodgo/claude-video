@@ -116,7 +116,8 @@ def select_caption(info: dict, language: str = 'auto') -> dict | None:
             key = keys[0]
             # Auto mode must prefer original ASR to translated/dubbed metadata.
             if kind == 'automatic' and language == 'auto' and originals:
-                key = originals[0]
+                # YouTube can list several "-orig" tracks (AI dubs); take the one in the video's language.
+                key = next((k for k in keys if k in originals), None) or min(originals, key=english_first)
             base = key.removesuffix('-orig')
             provenance = 'original' if original and base.split('-')[0] == original.split('-')[0] else 'unknown'
             if language != 'auto' and original and base.split('-')[0] != original.split('-')[0]:
